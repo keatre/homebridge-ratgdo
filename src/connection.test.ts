@@ -146,6 +146,21 @@ describe("openConnection", () => {
     assert.equal(openClient.calls[0]?.signal, shutdownSignal, "the caller's shutdown signal reaches the factory by reference, so an abort cancels the call itself");
   });
 
+  test("selects expected entities from the connected client", async () => {
+
+    const client = connectedClient();
+    let selectedClient: TestEspHomeClient | undefined;
+    const { result } = await run(makeFakeOpenClient(client), { expected: (connected) => {
+
+      selectedClient = connected as unknown as TestEspHomeClient;
+
+      return [coverId];
+    } });
+
+    assert.ok(result.ok);
+    assert.equal(selectedClient, client, "the selector receives the connected client before initial-state capture");
+  });
+
   test("encryption error (mismatched key): returns the encryption-invalid outcome and logs the encryption-configuration diagnostic", async () => {
 
     const { entries, result } = await run(makeFakeOpenClient(new EncryptionKeyInvalidError("bad key")));

@@ -11,9 +11,16 @@ import { mqttFeatureOptions } from "homebridge-plugin-utils";
  * a plainly narrowed type because a property either survives its typeof guard or it is absent - there is no third answer at this boundary. The platform resolves these
  * against the feature-option catalog and runs on the resolved shape below.
  */
+export interface ManualDeviceConfig {
+
+  encryptionKey?: string;
+  host: string;
+}
+
 export type RatgdoOptions = Partial<{
 
   debug: boolean;
+  manualDevices: ManualDeviceConfig[];
   mqttTopic: string;
   mqttUrl: string;
   options: string[];
@@ -27,6 +34,7 @@ export type RatgdoOptions = Partial<{
 export interface RatgdoResolvedConfig {
 
   debug: boolean;
+  manualDevices: ManualDeviceConfig[];
   mqttTopic: Nullable<string> | undefined;
   mqttUrl: Nullable<string> | undefined;
   options: string[] | undefined;
@@ -42,6 +50,27 @@ export type RatgdoGlobalValueOption = "Mqtt.Topic" | "Mqtt.Url";
  * asking it for a value-bearing option, or for one no global lookup admits, is a type error.
  */
 export type RatgdoGlobalFlagOption = "Log.Debug";
+
+function normalizeManualDevices(value: unknown): ManualDeviceConfig[] {
+
+  if(!Array.isArray(value)) {
+
+    return [];
+  }
+
+  return (value as unknown[]).flatMap((entry) => {
+
+    if(!entry || (typeof entry !== "object")) {
+
+      return [];
+    }
+
+    const host = ("host" in entry) && (typeof entry.host === "string") ? entry.host.trim() : "";
+    const encryptionKey = ("encryptionKey" in entry) && (typeof entry.encryptionKey === "string") ? entry.encryptionKey.trim() : "";
+
+    return host ? [{ host, ...(encryptionKey ? { encryptionKey } : {}) }] : [];
+  });
+}
 
 /* Normalize a Homebridge PlatformConfig into a typed RatgdoOptions. Homebridge passes plugin config through an open index-signature shape sourced from user JSON, so
  * without this boundary narrowing every consumer has to reach in with bracket notation - and downstream code would silently accept whatever shape the user supplied.
@@ -60,6 +89,7 @@ export function normalizeConfig(config: PlatformConfig | undefined): RatgdoOptio
   // PlatformConfig has an index signature typed as `any`, which would silently propagate `any` through the rest of the function. We re-read each field as `unknown`
   // so the typeof / Array.isArray guards below are forced to do real narrowing rather than rubber-stamping a type assertion.
   const debug: unknown = config["debug"];
+  const manualDevices: unknown = config["manualDevices"];
   const mqttTopic: unknown = config["mqttTopic"];
   const mqttUrl: unknown = config["mqttUrl"];
   const options: unknown = config["options"];
@@ -67,6 +97,7 @@ export function normalizeConfig(config: PlatformConfig | undefined): RatgdoOptio
   return {
 
     debug: (typeof debug === "boolean") ? debug : undefined,
+    manualDevices: normalizeManualDevices(manualDevices),
     mqttTopic: (typeof mqttTopic === "string") ? mqttTopic : undefined,
     mqttUrl: (typeof mqttUrl === "string") ? mqttUrl : undefined,
     options: (Array.isArray(options) && options.every((entry): entry is string => typeof entry === "string")) ? options : undefined

@@ -3,10 +3,10 @@
  * discovery.test.ts: Unit tests for parseRatgdoService - the pure mDNS-service-to-recognized-identity parse, classification, MAC normalization, and validity guard.
  */
 import { describe, test } from "node:test";
+import { parseRatgdoDeviceInfo, parseRatgdoService } from "./discovery.ts";
 import { RatgdoVariant } from "./types.ts";
 import assert from "node:assert/strict";
 import { makeMdnsService } from "./testing.helpers.ts";
-import { parseRatgdoService } from "./discovery.ts";
 
 /* This file constructs raw mDNS TXT payloads whose keys are the snake_case ESPHome wire names (esphome_version, project_name, ...), so camelcase is disabled for the
  * file - asserting the classifier against the exact wire shape is the whole point of these tests.
@@ -110,6 +110,39 @@ describe("parseRatgdoService", () => {
 
       assert.equal(parseRatgdoService(makeMdnsService({ mac: "aabbccddeeff", version: "2.0.0" })), null, "a device must advertise a project_name to be classified");
     });
+  });
+});
+
+describe("parseRatgdoDeviceInfo", () => {
+
+  const info = { esphomeVersion: "2026.8.0", friendlyName: "Garage", macAddress: "aa:bb:cc:dd:ee:ff", projectName: "ratgdo.esp32",
+    projectVersion: "2.5" };
+
+  test("derives a supported Ratgdo identity from DeviceInfo", () => {
+
+    const result = parseRatgdoDeviceInfo("10.0.20.121", info);
+
+    assert.ok(result);
+    assert.equal(result.variant, RatgdoVariant.RATGDO);
+    assert.equal(result.address, "10.0.20.121");
+    assert.equal(result.firmwareVersion, "2026.8.0");
+    assert.equal(result.model, "2.5");
+    assert.equal(result.friendlyName, "Garage");
+  });
+
+  test("rejects unsupported projects and malformed MAC addresses", () => {
+
+    assert.equal(parseRatgdoDeviceInfo("10.0.20.121", { ...info, projectName: "esphome.generic-sensor" }), null);
+    assert.equal(parseRatgdoDeviceInfo("10.0.20.121", { ...info, macAddress: "not-a-mac" }), null);
+  });
+
+  test("normalizes to the same MAC identity as mDNS", () => {
+
+    const manual = parseRatgdoDeviceInfo("10.0.20.121", info);
+    const mdns = parseRatgdoService(makeMdnsService({ esphome_version: info.esphomeVersion, mac: "AABBCCDDEEFF", project_name: info.projectName }));
+
+    assert.equal(manual?.macColon, mdns?.macColon);
+    assert.equal(manual?.strippedMac, mdns?.strippedMac);
   });
 });
 /* eslint-enable camelcase */
