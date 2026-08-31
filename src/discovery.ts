@@ -8,6 +8,7 @@
  * in the platform because it depends on instance state (hap, feature options, the device maps). Keeping the wire-derivation here makes the validity guard, the project
  * classification, and the MAC regex unit-testable against arbitrary mDNS input without a live network or a Homebridge harness.
  */
+import type { DeviceInfo } from "esphome-client";
 import type { Nullable } from "homebridge-plugin-utils";
 import { RATGDO_AUTODISCOVERY_PROJECTS } from "./settings.ts";
 import type { RatgdoVariant } from "./types.ts";
@@ -36,50 +37,51 @@ export interface DiscoveredRatgdo {
   readonly variant: RatgdoVariant;
 }
 
-/* Parse and classify a bonjour-service mDNS service into a recognized Ratgdo identity, or null when the service is not a device we configure. The validity guard
- * requires a parseable TXT record carrying a version (esphome_version or version), a MAC, a first IP address, and a project_name; the classification step matches that
- * project_name against RATGDO_AUTODISCOVERY_PROJECTS, which is both the recognition gate and the variant classifier in a single pass. Pure and I/O-free.
- */
-export function parseRatgdoService(service: Service): Nullable<DiscoveredRatgdo> {
+function parseRatgdoIdentity(address: string, firmwareVersion: string, friendlyName: string | undefined, mac: string, model: string | undefined,
+  projectName: string): Nullable<DiscoveredRatgdo> {
 
-  const txt = parseMdnsTxt(service.txt);
-
-  // We grab the first address the device advertised. With noUncheckedIndexedAccess on, this read is what surfaces the empty-addresses case to the type-checker.
-  const address = service.addresses?.[0];
-
-  // Reject any service that is not a fully-formed ESPHome Ratgdo advertisement. project_name is folded into this guard so the subsequent find() iterates a string
-  // rather than a string-or-undefined, and the firmware-version fallback below is guaranteed at least one of esphome_version / version (so its "0.0.0" default is a
-  // type-completing safety net, not a reachable runtime path).
-  if(!txt || (!txt.esphome_version && !txt.version) || !txt.mac || !address || (txt.project_name === undefined)) {
-
-    return null;
-  }
-
-  /* Single-pass filter-and-classify. RATGDO_AUTODISCOVERY_PROJECTS maps each project-name pattern to the device variant it identifies, so a successful match is both
-   * the discovery gate (we recognize this device) and the classifier (we know what variant to construct). An unmatched project_name is some other ESPHome device, and
-   * keeping the pattern and the variant adjacent in the registry means adding a variant is a single-line edit there rather than a coordinated change at two sites.
-   */
-  const projectName = txt.project_name;
   const project = RATGDO_AUTODISCOVERY_PROJECTS.find((entry) => entry.pattern.test(projectName));
+  const strippedMac = mac.replace(/[:-]/g, "").toUpperCase();
 
-  if(!project) {
+  if(!project || !/^[0-9A-F]{12}$/.test(strippedMac)) {
 
     return null;
   }
-
-  // Two MAC representations: macColon is the uppercased colon-delimited form HomeKit's UUID generator and the discovered-device dedup set use; strippedMac is the
-  // bare-hex form everything downstream consumes (device.mac, feature-option lookup keys, MQTT topics). The (?=.) lookahead inserts a colon after every pair except the
-  // final one, so AABBCCDDEEFF becomes AA:BB:CC:DD:EE:FF with no trailing colon.
-  const macColon = txt.mac.toUpperCase().replace(/(.{2})(?=.)/g, "$1:");
 
   return {
 
-    address: address,
-    firmwareVersion: txt.version ?? txt.esphome_version ?? "0.0.0",
-    friendlyName: txt.friendly_name,
-    macColon: macColon,
-    model: txt.project_version,
-    strippedMac: macColon.replace(/:/g, ""),
+    address,
+    firmwareVersion,
+    friendlyName,
+    macColon: strippedMac.replace(/(..)(?=.)/g, "$1:"),
+    model,
+    strippedMac,
     variant: project.variant
   };
+}
+
+/* Parse and classify a bonjour-service mDNS advertisement. */
+export function parseRatgdoService(service: Service): Nullable<DiscoveredRatgdo> {
+
+  const txt = parseMdnsTxt(service.txt);
+  const address = service.addresses?.[0];
+  const firmwareVersion = txt?.version ?? txt?.esphome_version;
+
+  if(!txt?.mac || !address || !firmwareVersion || (txt.project_name === undefined)) {
+
+    return null;
+  }
+
+  return parseRatgdoIdentity(address, firmwareVersion, txt.friendly_name, txt.mac, txt.project_version, txt.project_name);
+}
+
+/* Parse the same identity from the authoritative DeviceInfo returned by a direct ESPHome connection. */
+export function parseRatgdoDeviceInfo(address: string, info: Nullable<DeviceInfo>): Nullable<DiscoveredRatgdo> {
+
+  if(!info?.esphomeVersion || !info.macAddress || !info.projectName) {
+
+    return null;
+  }
+
+  return parseRatgdoIdentity(address, info.esphomeVersion, info.friendlyName ?? info.name, info.macAddress, info.projectVersion, info.projectName);
 }

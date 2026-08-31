@@ -71,6 +71,24 @@ describe("normalizeConfig", () => {
     });
   });
 
+  describe("the manualDevices field", () => {
+
+    test("normalizes valid hosts and optional encryption keys", () => {
+
+      const result = normalizeConfig(asConfig({ manualDevices: [ { encryptionKey: " key ", host: " 10.0.20.121 " }, { host: "ratgdo.local" } ] }));
+
+      assert.deepEqual(result.manualDevices, [ { encryptionKey: "key", host: "10.0.20.121" }, { host: "ratgdo.local" } ]);
+    });
+
+    test("ignores malformed entries and malformed optional keys", () => {
+
+      const result = normalizeConfig(asConfig({ manualDevices: [ null, "host", {}, { host: " " }, { host: 42 }, { encryptionKey: 42, host: "ratgdo.local" } ] }));
+
+      assert.deepEqual(result.manualDevices, [{ host: "ratgdo.local" }]);
+      assert.deepEqual(normalizeConfig(asConfig({ manualDevices: "ratgdo.local" })).manualDevices, []);
+    });
+  });
+
   describe("the debug field", () => {
 
     test("is true only when the input debug is the boolean true", () => {

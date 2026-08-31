@@ -3,22 +3,24 @@
  * platform.ts: homebridge-ratgdo platform class.
  */
 import type { API, DynamicPlatformPlugin, HAP, Logging, PlatformAccessory, PlatformConfig } from "homebridge";
+import type { ConnectionResult, OpenEspHomeClient } from "./connection.ts";
 import type { EspHomeClient, LifecycleEvent, LogEventData, TelemetryEvent } from "esphome-client";
 import { FeatureOptions, createMqttClient, prefixedLog, sanitizeName } from "homebridge-plugin-utils";
+import type { ManualDeviceConfig, RatgdoResolvedConfig } from "./options.ts";
 import { PLATFORM_NAME, PLUGIN_NAME, RATGDO_AUTODISCOVERY_INTERVAL, RATGDO_AUTODISCOVERY_TYPES, RATGDO_AUTODISCOVERY_WARMUP_OFFSETS } from "./settings.ts";
 import { consolidatedFlag, consolidatedValue, featureOptionCategories, featureOptions, normalizeConfig } from "./options.ts";
 import { isEncryptionError, openConnection } from "./connection.ts";
+import { parseRatgdoDeviceInfo, parseRatgdoService } from "./discovery.ts";
 import { setInterval as setIntervalAsync, setTimeout as setTimeoutAsync } from "node:timers/promises";
 import { Bonjour } from "bonjour-service";
+import type { DiscoveredRatgdo } from "./discovery.ts";
 import { LogLevel } from "esphome-client";
 import type { MqttClient } from "homebridge-plugin-utils";
 import type { Nullable } from "homebridge-plugin-utils";
 import { RatgdoAccessory } from "./device.ts";
 import type { RatgdoDevice } from "./types.ts";
-import type { RatgdoResolvedConfig } from "./options.ts";
 import type { Service } from "bonjour-service";
 import { parseBatteryState } from "./protocol/battery.ts";
-import { parseRatgdoService } from "./discovery.ts";
 import { performance } from "node:perf_hooks";
 import { ratgdoInitialStateEntityIds } from "./entities.ts";
 import { translateTelemetry } from "./protocol/telemetry.ts";
@@ -37,6 +39,12 @@ interface RatgdoConnection {
   subscriptions: Disposable[];
 }
 
+interface RatgdoPlatformDependencies {
+
+  createBonjour?: () => Bonjour;
+  openClient?: OpenEspHomeClient;
+}
+
 export class RatgdoPlatform implements DynamicPlatformPlugin {
 
   // Cached platform accessories keyed by HAP UUID. Map storage matches the rest of the platform's per-device stores (configuredDevices, connections) and gives O(1)
@@ -46,6 +54,7 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
   public readonly config: RatgdoResolvedConfig;
   public readonly configuredDevices: Map<string, RatgdoAccessory>;
   private readonly connections: Map<string, RatgdoConnection>;
+  private readonly createBonjour: () => Bonjour;
   private readonly discoveredDevices: Set<string>;
   public readonly featureOptions: FeatureOptions;
   public readonly hap: HAP;
@@ -53,12 +62,13 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
   // mDNS Bonjour instance, populated lazily in configureRatgdo() and destroyed in the constructor's shutdown handler. Holding a field reference keeps shutdown
   // ownership in one place instead of fragmenting it across multiple api.on("shutdown") registrations.
   private mdns?: Bonjour;
+  private readonly openClient?: OpenEspHomeClient;
   public readonly mqtt: Nullable<MqttClient>;
   // AbortController scoped to the platform's lifetime. Aborted on Homebridge shutdown so that every signal-aware resource we own (the MQTT client, any future
   // signal-driven primitive) tears itself down through one composed signal instead of per-resource imperative cleanup.
   private readonly shutdownController: AbortController;
 
-  constructor(log: Logging, config: PlatformConfig | undefined, api: API) {
+  constructor(log: Logging, config: PlatformConfig | undefined, api: API, dependencies: RatgdoPlatformDependencies = {}) {
 
     this.accessories = new Map();
     this.api = api;
@@ -67,6 +77,7 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
 
     this.configuredDevices = new Map();
     this.connections = new Map();
+    this.createBonjour = dependencies.createBonjour ?? ((): Bonjour => new Bonjour());
     this.discoveredDevices = new Set();
     this.featureOptions = new FeatureOptions(featureOptionCategories, featureOptions, legacy.options);
 
@@ -76,6 +87,7 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
     this.config = {
 
       debug: consolidatedFlag(this.featureOptions, "Log.Debug", legacy.debug),
+      manualDevices: legacy.manualDevices ?? [],
       mqttTopic: consolidatedValue(this.featureOptions, "Mqtt.Topic", legacy.mqttTopic),
       mqttUrl: consolidatedValue(this.featureOptions, "Mqtt.Url", legacy.mqttUrl),
       options: legacy.options
@@ -88,6 +100,7 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
     // Homebridge's global debug switch.
     this.log.debug = (message: string, ...parameters: unknown[]): void => this.debug(message, ...parameters);
     this.mqtt = null;
+    this.openClient = dependencies.openClient;
     this.shutdownController = new AbortController();
 
     // We can't start without being configured.
@@ -176,7 +189,7 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
 
     // Field-tracked Bonjour instance so the constructor's shutdown handler owns its teardown. Avoids fragmenting shutdown ownership across multiple api.on("shutdown")
     // registrations.
-    this.mdns = new Bonjour();
+    this.mdns = this.createBonjour();
 
     // Start ESPHome device discovery.
     for(const mdnsType of RATGDO_AUTODISCOVERY_TYPES) {
@@ -194,6 +207,14 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
       // Start the background discovery schedule, which fires every mDNS query for the lifetime of the browser: the bootstrap warmup burst followed by the
       // steady-state refresh loop, both bounded by the platform's shutdown signal.
       void this.runDiscoverySchedule(mdnsBrowser);
+    }
+
+    for(const manualDevice of this.config.manualDevices) {
+
+      void this.discoverManualDevice(manualDevice).catch((error: unknown) => {
+
+        this.log.error("Manual device %s: Discovery error: %s", manualDevice.host, util.inspect(error, { depth: null }));
+      });
     }
   }
 
@@ -250,14 +271,6 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
     }
   }
 
-  /* Ratgdo ESPHome device discovery. The discovery flow lives entirely in this function and runs in phases - parse mDNS, dedup, build the device record, log
-   * discovery, gate on the disabled feature option, connect, capture initial state, register the platform accessory, construct the RatgdoAccessory with real state,
-   * wire ongoing subscriptions, and finalize. Each phase is a single block; the function reads top-to-bottom as a timeline.
-   *
-   * The central design choice: `RatgdoAccessory` is constructed AFTER the ESPHome client has connected AND the LatestStateCache has populated with the device's
-   * initial state. The "we do not know yet" window is eliminated rather than modeled - the accessory is born with real telemetry data, configureXxx writes real
-   * values to HAP from frame zero, and no Not-Responding / placeholder-default machinery is needed.
-   */
   private async discoverRatgdoDevice(service: Service): Promise<void> {
 
     // Parse and classify the mDNS service into a recognized Ratgdo identity. parseRatgdoService owns the pure wire-derivation - the validity guard, the project-pattern
@@ -269,6 +282,46 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
 
       return;
     }
+
+    await this.configureResolvedDevice(discovered);
+  }
+
+  private async discoverManualDevice(manualDevice: ManualDeviceConfig): Promise<void> {
+
+    const identity: { value: Nullable<DiscoveredRatgdo> } = { value: null };
+    const connectLog = prefixedLog(this.log, () => manualDevice.host);
+    const connection = await openConnection({
+
+      expected: (client) => {
+
+        identity.value = parseRatgdoDeviceInfo(manualDevice.host, client.deviceInfo());
+
+        return identity.value ? ratgdoInitialStateEntityIds(identity.value.variant) : [];
+      },
+      host: manualDevice.host,
+      log: connectLog,
+      ...(this.openClient ? { openClient: this.openClient } : {}),
+      psk: manualDevice.encryptionKey ?? this.featureOptions.value("Device.Encryption.Key"),
+      shutdownSignal: this.shutdownController.signal
+    });
+
+    if(!connection.ok) {
+
+      return;
+    }
+
+    if(!identity.value) {
+
+      this.log.error("Manual device %s is not a supported Ratgdo device.", manualDevice.host);
+      connection.client[Symbol.dispose]();
+
+      return;
+    }
+
+    await this.configureResolvedDevice(identity.value, connection);
+  }
+
+  private async configureResolvedDevice(discovered: DiscoveredRatgdo, existingConnection?: ConnectionResult): Promise<void> {
 
     const { address, firmwareVersion, friendlyName, macColon, model, strippedMac, variant } = discovered;
     const uuid = this.hap.uuid.generate(macColon);
@@ -282,6 +335,8 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
      *     the connect path automatically without requiring a Homebridge restart.
      */
     if(this.configuredDevices.has(uuid) || this.discoveredDevices.has(macColon)) {
+
+      existingConnection?.client[Symbol.dispose]();
 
       return;
     }
@@ -315,6 +370,7 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
       }
 
       this.discoveredDevices.add(macColon);
+      existingConnection?.client[Symbol.dispose]();
 
       return;
     }
@@ -330,20 +386,26 @@ export class RatgdoPlatform implements DynamicPlatformPlugin {
     // client-internal debug lines honor the config.debug opt-in without a second wrapper. The name read is live in form but static in practice - RatgdoDevice.name is
     // readonly, fixed at discovery - which keeps client-internal messages (handshake, retries, heartbeat) titled by the mDNS-discovered name even after a HomeKit
     // rename; per-accessory logging routes through RatgdoAccessory's dynamic-name channel instead.
-    const connectLog = prefixedLog(this.log, () => device.name);
-    const expected = ratgdoInitialStateEntityIds(device.variant);
-    const connection = await openConnection({
+    let connection = existingConnection;
 
-      expected,
-      host: address,
-      log: connectLog,
-      psk: this.featureOptions.value("Device.Encryption.Key", strippedMac),
-      shutdownSignal: this.shutdownController.signal
-    });
+    if(!connection) {
 
-    if(!connection.ok) {
+      const connectLog = prefixedLog(this.log, () => device.name);
+      const outcome = await openConnection({
 
-      return;
+        expected: ratgdoInitialStateEntityIds(device.variant),
+        host: address,
+        log: connectLog,
+        psk: this.featureOptions.value("Device.Encryption.Key", strippedMac),
+        shutdownSignal: this.shutdownController.signal
+      });
+
+      if(!outcome.ok) {
+
+        return;
+      }
+
+      connection = outcome;
     }
 
     const { client, initialState } = connection;

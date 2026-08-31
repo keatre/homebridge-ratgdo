@@ -76,7 +76,7 @@ export interface CaptureInitialStateOptions {
  */
 export interface OpenConnectionOptions {
 
-  expected: readonly EntityId[];
+  expected: readonly EntityId[] | ((client: EspHomeClient) => readonly EntityId[]);
   host: string;
   log: HomebridgePluginLogging;
   openClient?: OpenEspHomeClient;
@@ -125,7 +125,8 @@ OpenConnectionOptions): Promise<ConnectionOutcome> {
       signal: shutdownSignal
     });
 
-    const initialState = await captureInitialState({ client, expected, shutdownSignal, timeoutSeconds });
+    const entities = (typeof expected === "function") ? expected(client) : expected;
+    const initialState = await captureInitialState({ client, expected: entities, shutdownSignal, timeoutSeconds });
 
     return { client, initialState, ok: true };
   } catch(error) {

@@ -974,7 +974,7 @@ export function makeTestPlatform(options: MakeTestPlatformOptions = {}): MakeTes
   const platform: TestPlatform = {
 
     api: { hap },
-    config: options.config ?? { debug: false, mqttTopic: undefined, mqttUrl: undefined, options: undefined },
+    config: options.config ?? { debug: false, manualDevices: [], mqttTopic: undefined, mqttUrl: undefined, options: undefined },
     debug: (message: string, ...parameters: unknown[]): void => {
 
       entries.push({ level: "debug", parameters: [ message, ...parameters ] });

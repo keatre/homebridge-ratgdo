@@ -17,6 +17,28 @@
         "description": "Name to use for Homebridge logging purposes. Default: Ratgdo."
       },
 
+      "manualDevices": {
+        "title": "Manual Devices",
+        "type": "array",
+        "description": "Optional direct hosts to try once at startup when mDNS cannot cross the network boundary.",
+        "items": {
+          "type": "object",
+          "required": [ "host" ],
+          "properties": {
+            "host": {
+              "title": "Hostname or IP Address",
+              "type": "string",
+              "minLength": 1
+            },
+            "encryptionKey": {
+              "title": "ESPHome API Encryption Key",
+              "type": "string",
+              "format": "password"
+            }
+          }
+        }
+      },
+
       "options": {
         "title": "Feature Options",
         "type": "array",
@@ -62,6 +84,7 @@
         {
           "description": "These settings should be rarely used or needed by most people. Use these with caution.",
           "items": [
+            "manualDevices",
             "name"
           ]
         }
